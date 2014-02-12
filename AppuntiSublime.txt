@@ -9,3 +9,8 @@ https://sublime.wbond.net/installation
 
 # Emmet plugin (ex zen-coding)
 https://github.com/sergeche/emmet-sublime
+
+# crea 2 columns
+S-A-2
+# switcha su colonna 1
+C-1
