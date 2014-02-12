@@ -1,0 +1,5 @@
+# In console mostra i comandi
+sublime.log_commands(True)
+
+# In console mostra i key events
+sublime.log_input(True)
