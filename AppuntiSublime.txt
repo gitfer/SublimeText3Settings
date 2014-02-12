@@ -3,3 +3,6 @@ sublime.log_commands(True)
 
 # In console mostra i key events
 sublime.log_input(True)
+
+# Installazione package control (C-M-p)
+https://sublime.wbond.net/installation
