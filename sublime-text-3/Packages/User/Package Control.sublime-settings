@@ -1,6 +1,7 @@
 {
 	"installed_packages":
 	[
+		"Cheat Sheets",
 		"SublimeLinter",
 		"SublimeLinter-jshint"
 	]
