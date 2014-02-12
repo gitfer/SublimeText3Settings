@@ -14,3 +14,6 @@ https://github.com/sergeche/emmet-sublime
 S-A-2
 # switcha su colonna 1
 C-1
+
+# Toggle sidebar
+C-K C-B
