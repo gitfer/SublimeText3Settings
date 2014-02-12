@@ -2,6 +2,7 @@
 	"installed_packages":
 	[
 		"Cheat Sheets",
+		"Emmet",
 		"HTML5",
 		"SublimeLinter",
 		"SublimeLinter-jshint"

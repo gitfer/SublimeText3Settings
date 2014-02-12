@@ -6,3 +6,6 @@ sublime.log_input(True)
 
 # Installazione package control (C-M-p)
 https://sublime.wbond.net/installation
+
+# Emmet plugin (ex zen-coding)
+https://github.com/sergeche/emmet-sublime
