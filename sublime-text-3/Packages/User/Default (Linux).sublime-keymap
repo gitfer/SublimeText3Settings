@@ -1,4 +1,5 @@
 [
 	// Toggle console
-	{ "keys": ["ctrl+shift+c"], "command": "show_panel", "args": {"panel": "console", "toggle": true} }
+	{ "keys": ["ctrl+shift+c"], "command": "show_panel", "args": {"panel": "console", "toggle": true} },
+	{ "keys": ["ctrl+shift+k"], "command": "toggle_comment" }
 ]
