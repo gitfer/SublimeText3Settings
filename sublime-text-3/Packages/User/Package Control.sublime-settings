@@ -2,10 +2,13 @@
 	"installed_packages":
 	[
 		"Cheat Sheets",
+		"CSSTidy",
 		"Emmet",
 		"HTML5",
 		"JsFormat",
+		"Sublimall",
 		"SublimeLinter",
+		"SublimeLinter-html-tidy",
 		"SublimeLinter-jshint"
 	]
 }
