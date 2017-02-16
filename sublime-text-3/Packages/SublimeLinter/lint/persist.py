@@ -32,16 +32,16 @@ LINT_MODES = (
     ('manual', 'Lint only when requested')
 )
 
-SYNTAX_RE = re.compile(r'(?i)/([^/]+)\.tmLanguage$')
+SYNTAX_RE = re.compile(r'(?i)/([^/]+)\.(?:tmLanguage|sublime-syntax)$')
 
 DEFAULT_GUTTER_THEME_PATH = 'Packages/SublimeLinter/gutter-themes/Default/Default.gutter-theme'
 
 
 class Settings:
-
     """This class provides global access to and management of plugin settings."""
 
     def __init__(self):
+        """Initialize a new instance."""
         self.settings = {}
         self.previous_settings = {}
         self.changeset = set()
@@ -141,7 +141,7 @@ class Settings:
              self.previous_settings.get('paths') != self.settings.get('paths'))
         ):
             need_relint = True
-            util.clear_caches()
+            util.clear_path_caches()
             self.changeset.discard('paths')
 
         # Add python paths if they changed
@@ -323,7 +323,7 @@ class Settings:
             gutter_marks['warning'] = gutter_marks['error'] = ''
 
 
-if not 'queue' in globals():
+if 'plugin_is_loaded' not in globals():
     settings = Settings()
 
     # A mapping between view ids and errors, which are line:(col, message) dicts

@@ -38,7 +38,6 @@ HTML_ENTITY_RE = re.compile(r'&(?:(?:#(x)?([0-9a-fA-F]{1,4}))|(\w+));')
 
 
 class LinterMeta(type):
-
     """Metaclass for Linter and its subclasses."""
 
     def __init__(cls, name, bases, attrs):
@@ -61,7 +60,7 @@ class LinterMeta(type):
         if bases:
             setattr(cls, 'disabled', False)
 
-            if name in ('PythonLinter', 'RubyLinter'):
+            if name in ('PythonLinter', 'RubyLinter', 'NodeLinter'):
                 return
 
             cls.alt_name = cls.make_alt_name(name)
@@ -175,7 +174,6 @@ class LinterMeta(type):
 
 
 class Linter(metaclass=LinterMeta):
-
     """
     The base class for linters.
 
@@ -281,6 +279,11 @@ class Linter(metaclass=LinterMeta):
     #
     config_file = None
 
+    # Either '=' or ':'. if '=', the config file argument is joined with the config file
+    # path found by '=' and passed as a single argument. If ':', config file argument and
+    # the value are passed as separate arguments.
+    config_joiner = ':'
+
     # Tab width
     tab_width = 1
 
@@ -357,7 +360,6 @@ class Linter(metaclass=LinterMeta):
     #
     # Internal class storage, do not set
     #
-    RC_SEARCH_LIMIT = 3
     errors = None
     highlight = None
     lint_settings = None
@@ -388,15 +390,17 @@ class Linter(metaclass=LinterMeta):
         cls.initialize()
 
     def __init__(self, view, syntax):
+        """Initialize a new instance."""
         self.view = view
         self.syntax = syntax
         self.code = ''
         self.highlight = highlight.Highlight()
         self.ignore_matches = None
+        self.demote_to_warning_matches = None
 
     @property
     def filename(self):
-        """Return the view's file path or '' of unsaved."""
+        """Return the view's file path or '' if unsaved."""
         return self.view.file_name() or ''
 
     @property
@@ -406,9 +410,8 @@ class Linter(metaclass=LinterMeta):
 
     @classmethod
     def clear_settings_caches(cls):
-        """Clear lru caches for this class' methods."""
+        """Clear settings-related caches for this class' methods."""
         cls.get_view_settings.cache_clear()
-        cls.get_merged_settings.cache_clear()
 
     @classmethod
     def settings(cls):
@@ -427,7 +430,7 @@ class Linter(metaclass=LinterMeta):
         return {key: value for key, value in settings.items() if key.startswith('@')}
 
     @lru_cache(maxsize=None)
-    def get_view_settings(self, no_inline=False):
+    def get_view_settings(self, inline=True):
         """
         Return a union of all settings specific to this linter, related to the given view.
 
@@ -445,34 +448,15 @@ class Linter(metaclass=LinterMeta):
 
         settings = self.get_merged_settings()
 
-        if not no_inline:
-            inline_settings = {}
-
-            if self.shebang_match:
-                eol = self.code.find('\n')
-
-                if eol != -1:
-                    setting = self.shebang_match(self.code[0:eol])
-
-                    if setting is not None:
-                        inline_settings[setting[0]] = setting[1]
-
-            if self.comment_re and (self.inline_settings or self.inline_overrides):
-                inline_settings.update(util.inline_settings(
-                    self.comment_re,
-                    self.code,
-                    prefix=self.name,
-                    alt_prefix=self.alt_name
-                ))
-
+        if inline:
+            inline_settings = self.get_inline_settings()
             settings = self.merge_inline_settings(settings.copy(), inline_settings)
 
         return settings
 
-    @lru_cache(maxsize=None)
     def get_merged_settings(self):
         """
-        Return a union of all non-inline settings specific to this linter, related to the given view.
+        Return a union of all non-inline settings specific to this view's linter.
 
         The settings are merged in the following order:
 
@@ -482,6 +466,8 @@ class Linter(metaclass=LinterMeta):
         user + project meta settings
         rc settings
         rc meta settings
+
+        After merging, tokens in the settings are replaced.
 
         """
 
@@ -504,26 +490,124 @@ class Linter(metaclass=LinterMeta):
         project_settings = project_settings.get('linters', {}).get(self.name, {})
         project_settings.update(meta)
 
-        # Update the linter's settings with the project settings
+        # Update the linter's settings with the project settings and rc settings
         settings = self.merge_project_settings(self.settings().copy(), project_settings)
-
-        # Update with rc settings
         self.merge_rc_settings(settings)
+        self.replace_settings_tokens(settings)
+        return settings
+
+    def get_inline_settings(self):
+        """Return shebang and inline settings from the current file."""
+        settings = {}
+
+        if self.shebang_match:
+            eol = self.code.find('\n')
+
+            if eol != -1:
+                setting = self.shebang_match(self.code[0:eol])
+
+                if setting is not None:
+                    settings[setting[0]] = setting[1]
+
+        if self.comment_re and (self.inline_settings or self.inline_overrides):
+            settings.update(util.inline_settings(
+                self.comment_re,
+                self.code,
+                prefix=self.name,
+                alt_prefix=self.alt_name
+            ))
 
         return settings
+
+    def replace_settings_tokens(self, settings):
+        """
+        Replace tokens with values in settings.
+
+        Supported tokens, in the order they are expanded:
+
+        ${project}: full path to the project's parent directory, if available.
+        ${directory}: full path to the parent directory of the current view's file.
+        ${home}: the user's $HOME directory.
+        ${sublime}: sublime text settings directory.
+        ${env:x}: the environment variable 'x'.
+
+        ${project} and ${directory} expansion are dependent on
+        having a window. Paths do not contain trailing directory separators.
+
+        """
+        def recursive_replace_value(expressions, value):
+            if isinstance(value, dict):
+                value = recursive_replace(expressions, value, nested=True)
+            elif isinstance(value, list):
+                value = [recursive_replace_value(expressions, item) for item in value]
+            elif isinstance(value, str):
+                for exp in expressions:
+                    if isinstance(exp['value'], str):
+                        value = value.replace(exp['token'], exp['value'])
+                    else:
+                        value = exp['token'].sub(exp['value'], value)
+
+            return value
+
+        def recursive_replace(expressions, mutable_input, nested=False):
+            for key, value in mutable_input.items():
+                mutable_input[key] = recursive_replace_value(expressions, value)
+            if nested:
+                return mutable_input
+
+        # Expressions are evaluated in list order.
+        expressions = []
+        window = self.view.window()
+        if window:
+            view = window.active_view()
+
+            if window.project_file_name():
+                project = os.path.dirname(window.project_file_name()).replace('\\', '/')
+
+                expressions.append({
+                    'token': '${project}',
+                    'value': project
+                })
+
+            expressions.append({
+                'token': '${directory}',
+                'value': (
+                    os.path.dirname(view.file_name()).replace('\\', '/') if
+                    view and view.file_name() else "FILE NOT ON DISK")
+            })
+
+        expressions.append({
+            'token': '${home}',
+            'value': os.path.expanduser('~').rstrip(os.sep).rstrip(os.altsep).replace('\\', '/') or 'HOME NOT SET'
+        })
+
+        expressions.append({
+            'token': '${sublime}',
+            'value': sublime.packages_path()
+        })
+
+        expressions.append({
+            'token': re.compile(r'\${env:(?P<variable>[^}]+)}'),
+            'value': (
+                lambda m: os.getenv(m.group('variable')) if
+                os.getenv(m.group('variable')) else
+                "%s NOT SET" % m.group('variable'))
+        })
+
+        recursive_replace(expressions, settings)
 
     def merge_rc_settings(self, settings):
         """
         Merge .sublimelinterrc settings with settings.
 
-        Searches for .sublimelinterrc in, starting at the directory of the linter's view.
+        Searches for .sublimelinterrc, starting at the directory of the linter's view.
         The search is limited to rc_search_limit directories. If found, the meta settings
         and settings for this linter in the rc file are merged with settings.
 
         """
 
-        search_limit = persist.settings.get('rc_search_limit', self.RC_SEARCH_LIMIT)
-        rc_settings = util.get_view_rc_settings(self.view, limit=search_limit)
+        limit = persist.settings.get('rc_search_limit', None)
+        rc_settings = util.get_view_rc_settings(self.view, limit=limit)
 
         if rc_settings:
             meta = self.meta_settings(rc_settings)
@@ -806,14 +890,15 @@ class Linter(metaclass=LinterMeta):
                 disabled.add(linter)
                 continue
 
-            # Because get_view_settings is expensive, we use an lru_cache
+            # Because get_view_settings is potentially expensive, we use an lru_cache
             # to cache its results. Before each lint, reset the cache.
             linter.clear_settings_caches()
-            view_settings = linter.get_view_settings(no_inline=True)
+            view_settings = linter.get_view_settings(inline=False)
 
             # We compile the ignore matches for a linter on each run,
             # clear the cache first.
             linter.ignore_matches = None
+            linter.demote_to_warning_matches = None
 
             if view_settings.get('@disable'):
                 disabled.add(linter)
@@ -933,6 +1018,63 @@ class Linter(metaclass=LinterMeta):
         else:
             return []
 
+    def compile_demote_to_warning_match(self, pattern):
+        """Return the compiled pattern, log the error if compilation fails."""
+        try:
+            return re.compile(pattern)
+        except re.error as err:
+            persist.printf(
+                'ERROR: {}: invalid demote_to_warning_match: "{}" ({})'
+                .format(self.name, pattern, str(err))
+            )
+            return None
+
+    def compiled_demote_to_warning_matches(self, demote_to_warning_match):
+        """
+        Compile the "demote_to_warning_match" linter setting as an optimization.
+
+        If it's a string, return a list with a single compiled regex.
+        If it's a list, return a list of the compiled regexes.
+        If it's a dict, return a list only of the regexes whose key
+        matches the file's extension.
+
+        """
+
+        if isinstance(demote_to_warning_match, str):
+            regex = self.compile_demote_to_warning_match(demote_to_warning_match)
+            return [regex] if regex else []
+
+        elif isinstance(demote_to_warning_match, list):
+            matches = []
+
+            for match in demote_to_warning_match:
+                regex = self.compile_demote_to_warning_match(match)
+
+                if regex:
+                    matches.append(regex)
+
+            return matches
+
+        elif isinstance(demote_to_warning_match, dict):
+            if not self.filename:
+                return []
+
+            ext = os.path.splitext(self.filename)[1].lower()
+
+            if not ext:
+                return []
+
+            # Try to match the extension, then the extension without the dot
+            demote_to_warning_match = demote_to_warning_match.get(ext, demote_to_warning_match.get(ext[1:]))
+
+            if demote_to_warning_match:
+                return self.compiled_demote_to_warning_matches(demote_to_warning_match)
+            else:
+                return []
+
+        else:
+            return []
+
     def reset(self, code, settings):
         """Reset a linter to work on the given code and filename."""
         self.errors = {}
@@ -946,6 +1088,14 @@ class Linter(metaclass=LinterMeta):
                 self.ignore_matches = self.compiled_ignore_matches(ignore_match)
             else:
                 self.ignore_matches = []
+
+        if self.demote_to_warning_matches is None:
+            demote_to_warning_match = settings.get('demote_to_warning_match')
+
+            if demote_to_warning_match:
+                self.demote_to_warning_matches = self.compiled_demote_to_warning_matches(demote_to_warning_match)
+            else:
+                self.demote_to_warning_matches = []
 
     @classmethod
     def which(cls, cmd):
@@ -1035,7 +1185,7 @@ class Linter(metaclass=LinterMeta):
 
     def insert_args(self, cmd):
         """Insert user arguments into cmd and return the result."""
-        args = self.build_args(self.get_view_settings())
+        args = self.build_args(self.get_view_settings(inline=True))
         cmd = list(cmd)
 
         if '*' in cmd:
@@ -1054,7 +1204,7 @@ class Linter(metaclass=LinterMeta):
         """Return any args the user specifies in settings as a list."""
 
         if settings is None:
-            settings = self.get_merged_settings()
+            settings = self.get_view_settings(inline=False)
 
         args = settings.get('args', [])
 
@@ -1159,7 +1309,10 @@ class Linter(metaclass=LinterMeta):
                 )
 
                 if config:
-                    args += [self.config_file[0], config]
+                    if self.config_joiner == '=':
+                        args.append('{}={}'.format(self.config_file[0], config))
+                    elif self.config_joiner == ':':
+                        args += [self.config_file[0], config]
 
         return args
 
@@ -1185,7 +1338,7 @@ class Linter(metaclass=LinterMeta):
 
         """
 
-        view_settings = self.get_view_settings()
+        view_settings = self.get_view_settings(inline=True)
 
         for name, info in self.args_map.items():
             value = view_settings.get(name)
@@ -1198,6 +1351,19 @@ class Linter(metaclass=LinterMeta):
                         name = transform(name)
 
                     options[name] = value
+
+    def get_chdir(self, settings):
+        """Find the chdir to use with the linter."""
+        chdir = settings.get('chdir', None)
+
+        if chdir and os.path.isdir(chdir):
+            return chdir
+            persist.debug('chdir has been set to: {0}'.format(chdir))
+        else:
+            if self.filename:
+                return os.path.dirname(self.filename)
+            else:
+                return os.path.realpath('.')
 
     def lint(self, hit_time):
         """
@@ -1216,10 +1382,6 @@ class Linter(metaclass=LinterMeta):
         if self.disabled:
             return
 
-        if self.filename:
-            cwd = os.getcwd()
-            os.chdir(os.path.dirname(self.filename))
-
         if self.cmd is None:
             cmd = None
         else:
@@ -1228,10 +1390,11 @@ class Linter(metaclass=LinterMeta):
             if cmd is not None and not cmd:
                 return
 
-        output = self.run(cmd, self.code)
+        settings = self.get_view_settings()
+        self.chdir = self.get_chdir(settings)
 
-        if self.filename:
-            os.chdir(cwd)
+        with util.cd(self.chdir):
+            output = self.run(cmd, self.code)
 
         if not output:
             return
@@ -1275,10 +1438,32 @@ class Linter(metaclass=LinterMeta):
                 else:
                     error_type = self.default_type
 
+                if error_type is highlight.ERROR:
+                    demote_to_warning = False
+
+                    if self.demote_to_warning_matches:
+                        for demote_to_warning_match in self.demote_to_warning_matches:
+                            if demote_to_warning_match.match(message):
+                                demote_to_warning = True
+
+                                if persist.debug_mode():
+                                    persist.printf(
+                                        '{} ({}): demote_to_warning_match: "{}" == "{}"'
+                                        .format(
+                                            self.name,
+                                            os.path.basename(self.filename) or '<unsaved>',
+                                            demote_to_warning_match.pattern,
+                                            message
+                                        )
+                                    )
+
+                                break
+
+                    if demote_to_warning:
+                        error_type = highlight.WARNING
+
                 if col is not None:
-                    # Pin the column to the start/end line offsets
                     start, end = self.highlight.full_line(line)
-                    col = max(min(col, (end - start) - 1), 0)
 
                     # Adjust column numbers to match the linter's tabs if necessary
                     if self.tab_width > 1:
@@ -1292,6 +1477,9 @@ class Linter(metaclass=LinterMeta):
                             if col - diff <= i:
                                 col = i
                                 break
+
+                    # Pin the column to the start/end line offsets
+                    col = max(min(col, (end - start) - 1), 0)
 
                 if col is not None:
                     self.highlight.range(line, col, near=near, error_type=error_type, word_re=self.word_re)
@@ -1551,7 +1739,6 @@ class Linter(metaclass=LinterMeta):
 
         if self.multiline:
             errors = self.regex.finditer(output)
-
             if errors:
                 for error in errors:
                     yield self.split_match(error)
@@ -1609,7 +1796,7 @@ class Linter(metaclass=LinterMeta):
 
         if self.tempfile_suffix:
             if self.tempfile_suffix != '-':
-                return self.tmpfile(cmd, code, suffix=self.get_tempfile_suffix())
+                return self.tmpfile(cmd, code)
             else:
                 return self.communicate(cmd)
         else:
@@ -1617,13 +1804,13 @@ class Linter(metaclass=LinterMeta):
 
     def get_tempfile_suffix(self):
         """Return the mapped tempfile_suffix."""
-        if self.tempfile_suffix:
+        if self.tempfile_suffix and not self.view.file_name():
             if isinstance(self.tempfile_suffix, dict):
                 suffix = self.tempfile_suffix.get(persist.get_syntax(self.view), self.syntax)
             else:
                 suffix = self.tempfile_suffix
 
-            if suffix and suffix[0] != '.':
+            if not suffix.startswith('.'):
                 suffix = '.' + suffix
 
             return suffix
@@ -1632,7 +1819,7 @@ class Linter(metaclass=LinterMeta):
 
     # popen wrappers
 
-    def communicate(self, cmd, code=''):
+    def communicate(self, cmd, code=None):
         """Run an external executable using stdin to pass code and return its output."""
         if '@' in cmd:
             cmd[cmd.index('@')] = self.filename
@@ -1650,6 +1837,7 @@ class Linter(metaclass=LinterMeta):
         return util.tmpfile(
             cmd,
             code,
+            self.filename,
             suffix or self.get_tempfile_suffix(),
             output_stream=self.error_stream,
             env=self.env)
@@ -1663,11 +1851,3 @@ class Linter(metaclass=LinterMeta):
             code,
             output_stream=self.error_stream,
             env=self.env)
-
-    def popen(self, cmd, env=None):
-        """Run cmd in a subprocess with the given environment and return the output."""
-        return util.popen(
-            cmd,
-            env=env,
-            extra_env=self.env,
-            output_stream=self.error_stream)

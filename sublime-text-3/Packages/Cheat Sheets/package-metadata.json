@@ -1,1 +1,1 @@
-{"description": "A Sublime Text cheat sheets plugin.", "version": "1.0.16", "url": "https://github.com/dmikalova/sublime-cheat-sheets"}
+{"url": "https://github.com/dmikalova/sublime-cheat-sheets", "platforms": ["*"], "dependencies": [], "sublime_text": "*", "version": "1.0.19", "description": "A Sublime Text cheat sheets plugin."}

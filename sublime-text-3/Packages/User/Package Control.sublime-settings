@@ -1,12 +1,17 @@
 {
+	"bootstrapped": true,
+	"in_process_packages":
+	[
+	],
 	"installed_packages":
 	[
+		"Babel",
 		"Cheat Sheets",
 		"CSSTidy",
 		"Emmet",
 		"HTML5",
 		"JsFormat",
-		"Sublimall",
+		"Package Control",
 		"SublimeLinter",
 		"SublimeLinter-html-tidy",
 		"SublimeLinter-jshint"

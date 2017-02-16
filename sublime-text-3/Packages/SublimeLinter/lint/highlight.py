@@ -67,10 +67,10 @@ def mark_style_names():
 
 
 class HighlightSet:
-
     """This class maintains a set of Highlight objects and performs bulk operations on them."""
 
     def __init__(self):
+        """Initialize a new instance."""
         self.all = set()
 
     def add(self, highlight):
@@ -116,12 +116,27 @@ class HighlightSet:
         for highlight in self.all:
             highlight.reset()
 
+    def line_type(self, line):
+        """Return the primary error type for the given line number."""
+        if not self.all:
+            return None
+
+        line_type = None
+        for highlight in self.all:
+            if line_type == ERROR:
+                continue
+            _line_type = highlight.lines.get(line)
+            if _line_type != WARNING and line_type == WARNING:
+                continue
+            line_type = _line_type
+        return line_type
+
 
 class Highlight:
-
     """This class maintains error marks and knows how to draw them."""
 
     def __init__(self, code=''):
+        """Initialize a new instance."""
         self.code = code
         self.marks = {WARNING: [], ERROR: []}
         self.mark_style = 'outline'

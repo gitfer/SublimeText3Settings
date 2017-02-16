@@ -14,16 +14,22 @@
 from functools import lru_cache
 from glob import glob
 import json
+import locale
 from numbers import Number
 import os
+import getpass
 import re
 import shutil
 from string import Template
+import stat
 import sublime
 import subprocess
 import sys
 import tempfile
 from xml.etree import ElementTree
+
+if sublime.platform() != 'windows':
+    import pwd
 
 #
 # Public constants
@@ -44,11 +50,18 @@ MARK_COLOR_RE = (
     r'(\s*<string>sublimelinter\.{}</string>\s*\r?\n'
     r'\s*<key>settings</key>\s*\r?\n'
     r'\s*<dict>\s*\r?\n'
+    r'(?:\s*<key>(?:background|fontStyle)</key>\s*\r?\n'
+    r'\s*<string>.*?</string>\r?\n)*'
     r'\s*<key>foreground</key>\s*\r?\n'
     r'\s*<string>)#.+?(</string>\s*\r?\n)'
 )
 
 ANSI_COLOR_RE = re.compile(r'\033\[[0-9;]*m')
+
+UNSAVED_FILENAME = 'untitled'
+
+# Temp directory used to store temp files for linting
+tempdir = os.path.join(tempfile.gettempdir(), 'SublimeLinter3-' + getpass.getuser())
 
 
 # settings utils
@@ -145,11 +158,12 @@ def get_view_rc_settings(view, limit=None):
     filename = view.file_name()
 
     if filename:
-        return get_rc_settings(os.path.dirname(filename))
+        return get_rc_settings(os.path.dirname(filename), limit=limit)
     else:
         return None
 
 
+@lru_cache(maxsize=None)
 def get_rc_settings(start_dir, limit=None):
     """
     Search for a file named .sublimelinterrc starting in start_dir.
@@ -162,7 +176,7 @@ def get_rc_settings(start_dir, limit=None):
     """
 
     if not start_dir:
-        return
+        return None
 
     path = find_file(start_dir, '.sublimelinterrc', limit=limit)
 
@@ -180,7 +194,12 @@ def get_rc_settings(start_dir, limit=None):
 
 
 def generate_color_scheme(from_reload=True):
-    """Asynchronously call generate_color_scheme_async."""
+    """
+    Asynchronously call generate_color_scheme_async.
+
+    from_reload is True if this is called from the change callback for user settings.
+
+    """
 
     # If this was called from a reload of prefs, turn off the prefs observer,
     # otherwise we'll end up back here when ST updates the prefs with the new color.
@@ -200,12 +219,24 @@ def generate_color_scheme_async():
     """
     Generate a modified copy of the current color scheme that contains SublimeLinter color entries.
 
-    from_reload is True if this is called from the change callback for user settings.
-
     The current color scheme is checked for SublimeLinter color entries. If any are missing,
-    the scheme is copied, the entries are added, and the color scheme is rewritten to Packages/User.
+    the scheme is copied, the entries are added, and the color scheme is rewritten to Packages/User/SublimeLinter.
 
     """
+
+    # First make sure the user prefs are valid. If not, bail.
+    path = os.path.join(sublime.packages_path(), 'User', 'Preferences.sublime-settings')
+
+    if (os.path.isfile(path)):
+        try:
+            with open(path, mode='r', encoding='utf-8') as f:
+                json = f.read()
+
+            sublime.decode_value(json)
+        except:
+            from . import persist
+            persist.printf('generate_color_scheme: Preferences.sublime-settings invalid, aborting')
+            return
 
     prefs = sublime.load_settings('Preferences.sublime-settings')
     scheme = prefs.get('color_scheme')
@@ -239,17 +270,20 @@ def generate_color_scheme_async():
         color = persist.settings.get('{}_color'.format(style), DEFAULT_MARK_COLORS[style]).lstrip('#')
         styles.append(ElementTree.XML(COLOR_SCHEME_STYLES[style].format(color)))
 
-    # Write the amended color scheme to Packages/User
+    if not os.path.exists(os.path.join(sublime.packages_path(), 'User', 'SublimeLinter')):
+        os.makedirs(os.path.join(sublime.packages_path(), 'User', 'SublimeLinter'))
+
+    # Write the amended color scheme to Packages/User/SublimeLinter
     original_name = os.path.splitext(os.path.basename(scheme))[0]
     name = original_name + ' (SL)'
-    scheme_path = os.path.join(sublime.packages_path(), 'User', name + '.tmTheme')
+    scheme_path = os.path.join(sublime.packages_path(), 'User', 'SublimeLinter', name + '.tmTheme')
 
     with open(scheme_path, 'w', encoding='utf8') as f:
         f.write(COLOR_SCHEME_PREAMBLE)
         f.write(ElementTree.tostring(plist, encoding='unicode'))
 
     # Set the amended color scheme to the current color scheme
-    path = os.path.join('User', os.path.basename(scheme_path))
+    path = os.path.join('User', 'SublimeLinter', os.path.basename(scheme_path))
     prefs.set('color_scheme', packages_relative_path(path))
     sublime.save_settings('Preferences.sublime-settings')
 
@@ -260,8 +294,9 @@ def change_mark_colors(error_color, warning_color):
     error_color = error_color.lstrip('#')
     warning_color = warning_color.lstrip('#')
 
-    path = os.path.join(sublime.packages_path(), 'User', '*.tmTheme')
-    themes = glob(path)
+    base_path = os.path.join(sublime.packages_path(), 'User', '*.tmTheme')
+    sublime_path = os.path.join(sublime.packages_path(), 'User', 'SublimeLinter', '*.tmTheme')
+    themes = glob(sublime_path) + glob(base_path)
 
     for theme in themes:
         with open(theme, encoding='utf8') as f:
@@ -273,92 +308,6 @@ def change_mark_colors(error_color, warning_color):
 
             with open(theme, encoding='utf8', mode='w') as f:
                 f.write(text)
-
-
-def install_syntaxes():
-    """Asynchronously call install_syntaxes_async."""
-    sublime.set_timeout_async(install_syntaxes_async, 0)
-
-
-def install_syntaxes_async():
-    """
-    Install fixed syntax packages.
-
-    Unfortunately the scope definitions in some syntax definitions
-    (HTML at the moment) incorrectly define embedded scopes, which leads
-    to spurious lint errors.
-
-    This method copies all of the syntax packages in fixed_syntaxes to Packages
-    so that they override the built in syntax package.
-
-    """
-
-    from . import persist
-
-    plugin_dir = os.path.dirname(os.path.dirname(__file__))
-    syntaxes_dir = os.path.join(plugin_dir, 'fixed-syntaxes')
-
-    for syntax in os.listdir(syntaxes_dir):
-        # See if our version of the syntax already exists in Packages
-        src_dir = os.path.join(syntaxes_dir, syntax)
-        version_file = os.path.join(src_dir, 'sublimelinter.version')
-
-        if not os.path.isdir(src_dir) or not os.path.isfile(version_file):
-            continue
-
-        with open(version_file, encoding='utf8') as f:
-            my_version = int(f.read().strip())
-
-        dest_dir = os.path.join(sublime.packages_path(), syntax)
-        version_file = os.path.join(dest_dir, 'sublimelinter.version')
-
-        if os.path.isdir(dest_dir):
-            if os.path.isfile(version_file):
-                with open(version_file, encoding='utf8') as f:
-                    try:
-                        other_version = int(f.read().strip())
-                    except ValueError:
-                        other_version = 0
-
-                persist.debug('found existing {} syntax, version {}'.format(syntax, other_version))
-                copy = my_version > other_version
-            else:
-                copy = sublime.ok_cancel_dialog(
-                    'An existing {} syntax definition exists, '.format(syntax) +
-                    'and SublimeLinter wants to overwrite it with its own version. ' +
-                    'Is that okay?')
-
-        else:
-            copy = True
-
-        if copy:
-            copy_syntax(syntax, src_dir, my_version, dest_dir)
-
-    update_syntax_map()
-
-
-def copy_syntax(syntax, src_dir, version, dest_dir):
-    """Copy a customized syntax and related files to Packages."""
-    from . import persist
-
-    try:
-        cached = os.path.join(sublime.cache_path(), syntax)
-
-        if os.path.isdir(cached):
-            shutil.rmtree(cached)
-
-        if not os.path.exists(dest_dir):
-            os.mkdir(dest_dir)
-
-        for filename in os.listdir(src_dir):
-            shutil.copy2(os.path.join(src_dir, filename), dest_dir)
-
-        persist.printf('copied {} syntax version {}'.format(syntax, version))
-    except OSError as ex:
-        persist.printf(
-            'ERROR: could not copy {} syntax package: {}'
-            .format(syntax, str(ex))
-        )
 
 
 def update_syntax_map():
@@ -481,7 +430,7 @@ def climb(start_dir, limit=None):
     """
     Generate directories, starting from start_dir.
 
-    If limit is None or <= 0, stop at the root directory.
+    If limit is None, stop at the root directory.
     Otherwise return a maximum of limit directories.
 
     """
@@ -496,6 +445,7 @@ def climb(start_dir, limit=None):
             limit -= 1
 
 
+@lru_cache(maxsize=None)
 def find_file(start_dir, name, parent=False, limit=None, aux_dirs=[]):
     """
     Find the given file by searching up the file hierarchy from start_dir.
@@ -503,7 +453,7 @@ def find_file(start_dir, name, parent=False, limit=None, aux_dirs=[]):
     If the file is found and parent is False, returns the path to the file.
     If parent is True the path to the file's parent directory is returned.
 
-    If limit is None or <= 0, the search will continue up to the root directory.
+    If limit is None, the search will continue up to the root directory.
     Otherwise a maximum of limit directories will be checked.
 
     If aux_dirs is not empty and the file hierarchy search failed,
@@ -603,7 +553,7 @@ def get_shell_path(env):
         '/usr/bin', '/usr/local/bin',
         '/usr/local/php/bin', '/usr/local/php5/bin'
     ):
-        if not path in split:
+        if path not in split:
             p += (':' + path)
 
     return p
@@ -699,7 +649,7 @@ def create_environment():
     paths = persist.settings.get('paths', {})
 
     if sublime.platform() in paths:
-        paths = convert_type(paths[sublime.platform()], [])
+        paths = [os.path.abspath(os.path.expanduser(path)) for path in convert_type(paths[sublime.platform()], [])]
     else:
         paths = []
 
@@ -722,8 +672,12 @@ def create_environment():
 
     # Many linters use stdin, and we convert text to utf-8
     # before sending to stdin, so we have to make sure stdin
-    # in the target executable is looking for utf-8.
+    # in the target executable is looking for utf-8. Some
+    # linters (like ruby) need to have LANG and/or LC_CTYPE
+    # set as well.
     env['PYTHONIOENCODING'] = 'utf8'
+    env['LANG'] = 'en_US.UTF-8'
+    env['LC_CTYPE'] = 'en_US.UTF-8'
 
     return env
 
@@ -739,8 +693,9 @@ def which(cmd, module=None):
     Return the full path to the given command, or None if not found.
 
     If cmd is in the form [script]@python[version], find_python is
-    called to locate the appropriate version of python. The result
-    is a tuple of the full python path and the full path to the script
+    called to locate the appropriate version of python. If an executable
+    version of the script can be found, its path is returned. Otherwise
+    the result is a tuple of the full python path and the full path to the script
     (or None if there is no script).
 
     """
@@ -750,7 +705,19 @@ def which(cmd, module=None):
     if match:
         args = match.groupdict()
         args['module'] = module
-        return find_python(**args)[0:2]
+        path = find_python(**args)[0:2]
+
+        # If a script is requested and an executable path is returned
+        # with no script path, just use the executable.
+        if (
+            path is not None and
+            path[0] is not None and
+            path[1] is None and
+            args['script']  # for the case where there is no script in cmd
+        ):
+            return path[0]
+        else:
+            return path
     else:
         return find_executable(cmd)
 
@@ -771,7 +738,8 @@ def get_python_version(path):
     """Return a dict with the major/minor version of the python at path."""
 
     try:
-        output = communicate((path, '-V'), '', output_stream=STREAM_STDERR)
+        # Different python versions use different output streams, so check both
+        output = communicate((path, '-V'), '', output_stream=STREAM_BOTH)
 
         # 'python -V' returns 'Python <version>', extract the version number
         return extract_major_minor_version(output.split(' ')[1])
@@ -870,6 +838,9 @@ def find_python(version=None, script=None, module=None):
 
                 if script_path is None:
                     path = None
+                elif script_path.endswith('.exe'):
+                    path = script_path
+                    script_path = None
         else:
             path = script_path = None
 
@@ -944,9 +915,12 @@ def find_windows_python(version):
         # with the <major><minor> version number, so for matching with the version
         # passed in, strip any decimal points.
         stripped_version = version.replace('.', '')
-        prefix = os.path.abspath('\\Python')
+        prefix = os.path.abspath(os.path.join(
+            os.environ.get("SYSTEMROOT", "\\")[:2],
+            'Python'
+        ))
         prefix_len = len(prefix)
-        dirs = glob(prefix + '*')
+        dirs = sorted(glob(prefix + '*'), reverse=True)
         from . import persist
 
         # Try the exact version first, then the major version
@@ -971,15 +945,27 @@ def find_windows_python(version):
 def find_python_script(python_path, script):
     """Return the path to the given script, or None if not found."""
     if sublime.platform() in ('osx', 'linux'):
+        pyenv = which('pyenv')
+        if pyenv:
+            out = run_shell_cmd((os.environ['SHELL'], '-l', '-c',
+                                 'echo ""; {} which {}'.format(pyenv, script))).strip().decode().split('\n')[-1]
+            if os.path.isfile(out):
+                return out
         return which(script)
     else:
-        # On Windows, scripts are .py files in <python directory>/Scripts
-        script_path = os.path.join(os.path.dirname(python_path), 'Scripts', script + '-script.py')
+        # On Windows, scripts may be .exe files or .py files in <python directory>/Scripts
+        scripts_path = os.path.join(os.path.dirname(python_path), 'Scripts')
+        script_path = os.path.join(scripts_path, script + '.exe')
 
         if os.path.exists(script_path):
             return script_path
-        else:
-            return None
+
+        script_path = os.path.join(scripts_path, script + '-script.py')
+
+        if os.path.exists(script_path):
+            return script_path
+
+        return None
 
 
 @lru_cache(maxsize=None)
@@ -1065,17 +1051,32 @@ def get_subl_executable_path():
 
 # popen utils
 
+def decode(bytes):
+    """
+    Decode and return a byte string using utf8, falling back to system's encoding if that fails.
+
+    So far we only have to do this because javac is so utterly hopeless it uses CP1252
+    for its output on Windows instead of UTF8, even if the input encoding is specified as UTF8.
+    Brilliant! But then what else would you expect from Oracle?
+
+    """
+    if not bytes:
+        return ''
+
+    try:
+        return bytes.decode('utf8')
+    except UnicodeError:
+        return bytes.decode(locale.getpreferredencoding(), errors='replace')
+
+
 def combine_output(out, sep=''):
     """Return stdout and/or stderr combined into a string, stripped of ANSI colors."""
-    output = sep.join((
-        (out[0].decode('utf8') or '') if out[0] else '',
-        (out[1].decode('utf8') or '') if out[1] else '',
-    ))
+    output = sep.join((decode(out[0]), decode(out[1])))
 
     return ANSI_COLOR_RE.sub('', output)
 
 
-def communicate(cmd, code='', output_stream=STREAM_STDOUT, env=None):
+def communicate(cmd, code=None, output_stream=STREAM_STDOUT, env=None):
     """
     Return the result of sending code via stdin to an executable.
 
@@ -1085,17 +1086,77 @@ def communicate(cmd, code='', output_stream=STREAM_STDOUT, env=None):
 
     """
 
-    out = popen(cmd, output_stream=output_stream, extra_env=env)
+    # On Windows, using subprocess.PIPE with Popen() is broken when not
+    # sending input through stdin. So we use temp files instead of a pipe.
+    if code is None and os.name == 'nt':
+        if output_stream != STREAM_STDERR:
+            stdout = tempfile.TemporaryFile()
+        else:
+            stdout = None
+
+        if output_stream != STREAM_STDOUT:
+            stderr = tempfile.TemporaryFile()
+        else:
+            stderr = None
+    else:
+        stdout = stderr = None
+
+    out = popen(cmd, stdout=stdout, stderr=stderr, output_stream=output_stream, extra_env=env)
 
     if out is not None:
-        code = code.encode('utf8')
+        if code is not None:
+            code = code.encode('utf8')
+
         out = out.communicate(code)
+
+        if code is None and os.name == 'nt':
+            out = list(out)
+
+            for f, index in ((stdout, 0), (stderr, 1)):
+                if f is not None:
+                    f.seek(0)
+                    out[index] = f.read()
+
         return combine_output(out)
     else:
         return ''
 
 
-def tmpfile(cmd, code, suffix='', output_stream=STREAM_STDOUT, env=None):
+def create_tempdir():
+    """Create a directory within the system temp directory used to create temp files."""
+    try:
+        if os.path.isdir(tempdir):
+            shutil.rmtree(tempdir)
+
+        os.mkdir(tempdir)
+
+        # Make sure the directory can be removed by anyone in case the user
+        # runs ST later as another user.
+        os.chmod(tempdir, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+
+    except PermissionError:
+        if sublime.platform() != 'windows':
+            current_user = pwd.getpwuid(os.geteuid())[0]
+            temp_uid = os.stat(tempdir).st_uid
+            temp_user = pwd.getpwuid(temp_uid)[0]
+            message = (
+                'The SublimeLinter temp directory:\n\n{0}\n\ncould not be cleared '
+                'because it is owned by \'{1}\' and you are logged in as \'{2}\'. '
+                'Please use sudo to remove the temp directory from a terminal.'
+            ).format(tempdir, temp_user, current_user)
+        else:
+            message = (
+                'The SublimeLinter temp directory ({}) could not be reset '
+                'because it belongs to a different user.'
+            ).format(tempdir)
+
+        sublime.error_message(message)
+
+    from . import persist
+    persist.debug('temp directory:', tempdir)
+
+
+def tmpfile(cmd, code, filename, suffix='', output_stream=STREAM_STDOUT, env=None):
     """
     Return the result of running an executable against a temporary file containing code.
 
@@ -1107,10 +1168,18 @@ def tmpfile(cmd, code, suffix='', output_stream=STREAM_STDOUT, env=None):
 
     """
 
-    f = None
+    if not filename:
+        filename = UNSAVED_FILENAME
+    else:
+        filename = os.path.basename(filename)
+
+    if suffix:
+        filename = os.path.splitext(filename)[0] + suffix
+
+    path = os.path.join(tempdir, filename)
 
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        with open(path, mode='wb') as f:
             if isinstance(code, str):
                 code = code.encode('utf-8')
 
@@ -1120,20 +1189,13 @@ def tmpfile(cmd, code, suffix='', output_stream=STREAM_STDOUT, env=None):
         cmd = list(cmd)
 
         if '@' in cmd:
-            cmd[cmd.index('@')] = f.name
+            cmd[cmd.index('@')] = path
         else:
-            cmd.append(f.name)
+            cmd.append(path)
 
-        out = popen(cmd, output_stream=output_stream, extra_env=env)
-
-        if out:
-            out = out.communicate()
-            return combine_output(out)
-        else:
-            return ''
+        return communicate(cmd, output_stream=output_stream, env=env)
     finally:
-        if f:
-            os.remove(f.name)
+        os.remove(path)
 
 
 def tmpdir(cmd, files, filename, code, output_stream=STREAM_STDOUT, env=None):
@@ -1148,11 +1210,10 @@ def tmpdir(cmd, files, filename, code, output_stream=STREAM_STDOUT, env=None):
 
     """
 
-    filename = os.path.basename(filename)
-    d = tempfile.mkdtemp()
+    filename = os.path.basename(filename) if filename else ''
     out = None
 
-    try:
+    with tempfile.TemporaryDirectory(dir=tempdir) as d:
         for f in files:
             try:
                 os.makedirs(os.path.join(d, os.path.dirname(f)))
@@ -1174,44 +1235,38 @@ def tmpdir(cmd, files, filename, code, output_stream=STREAM_STDOUT, env=None):
                 shutil.copyfile(f, target)
 
         os.chdir(d)
-        out = popen(cmd, output_stream=output_stream, extra_env=env)
+        out = communicate(cmd, output_stream=output_stream, env=env)
 
         if out:
-            out = out.communicate()
-            out = combine_output(out, sep='\n')
-
             # filter results from build to just this filename
             # no guarantee all syntaxes are as nice about this as Go
             # may need to improve later or just defer to communicate()
             out = '\n'.join([
                 line for line in out.split('\n') if filename in line.split(':', 1)[0]
             ])
-        else:
-            out = ''
-    finally:
-        shutil.rmtree(d, True)
 
     return out or ''
 
 
-def popen(cmd, output_stream=STREAM_BOTH, env=None, extra_env=None):
+def popen(cmd, stdout=None, stderr=None, output_stream=STREAM_BOTH, env=None, extra_env=None):
     """Open a pipe to an external process and return a Popen object."""
 
     info = None
 
     if os.name == 'nt':
         info = subprocess.STARTUPINFO()
-        info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        info.dwFlags |= subprocess.STARTF_USESTDHANDLES | subprocess.STARTF_USESHOWWINDOW
         info.wShowWindow = subprocess.SW_HIDE
 
     if output_stream == STREAM_BOTH:
-        stdout = stderr = subprocess.PIPE
+        stdout = stdout or subprocess.PIPE
+        stderr = stderr or subprocess.PIPE
     elif output_stream == STREAM_STDOUT:
-        stdout = subprocess.PIPE
+        stdout = stdout or subprocess.PIPE
         stderr = subprocess.DEVNULL
     else:  # STREAM_STDERR
         stdout = subprocess.DEVNULL
-        stderr = subprocess.PIPE
+        stderr = stderr or subprocess.PIPE
 
     if env is None:
         env = create_environment()
@@ -1221,9 +1276,13 @@ def popen(cmd, output_stream=STREAM_BOTH, env=None, extra_env=None):
 
     try:
         return subprocess.Popen(
-            cmd, stdin=subprocess.PIPE,
-            stdout=stdout, stderr=stderr,
-            startupinfo=info, env=env)
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=stdout,
+            stderr=stderr,
+            startupinfo=info,
+            env=env
+        )
     except Exception as err:
         from . import persist
         persist.printf('ERROR: could not launch', repr(cmd))
@@ -1242,8 +1301,8 @@ def apply_to_all_views(callback):
 
 # misc utils
 
-def clear_caches():
-    """Clear the caches of all methods in this module that use an lru_cache."""
+def clear_path_caches():
+    """Clear the caches of all path-related methods in this module that use an lru_cache."""
     create_environment.cache_clear()
     which.cache_clear()
     find_python.cache_clear()
@@ -1325,6 +1384,23 @@ def center_region_in_view(region, view):
     if y2 == y1:
         view.set_viewport_position((x1, y1 - 1.0))
         view.show_at_center(region)
+
+
+class cd:
+    """Context manager for changing the current working directory."""
+
+    def __init__(self, newPath):
+        """Save the new wd."""
+        self.newPath = os.path.expanduser(newPath)
+
+    def __enter__(self):
+        """Save the old wd and change to the new wd."""
+        self.savedPath = os.getcwd()
+        os.chdir(self.newPath)
+
+    def __exit__(self, etype, value, traceback):
+        """Go back to the old wd."""
+        os.chdir(self.savedPath)
 
 
 # color-related constants

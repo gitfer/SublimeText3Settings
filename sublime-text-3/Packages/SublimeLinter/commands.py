@@ -13,6 +13,7 @@
 
 import datetime
 from fnmatch import fnmatch
+from glob import glob
 import json
 import os
 import re
@@ -44,9 +45,9 @@ def error_command(method):
         vid = self.view.id()
 
         if vid in persist.errors and persist.errors[vid]:
-            method(self, self.view, persist.errors[vid], **kwargs)
+            method(self, self.view, persist.errors[vid], persist.highlights[vid], **kwargs)
         else:
-            sublime.message_dialog('No lint errors.')
+            sublime.status_message('No lint errors.')
 
     return run
 
@@ -60,7 +61,6 @@ def select_line(view, line):
 
 
 class SublimelinterLintCommand(sublime_plugin.TextCommand):
-
     """A command that lints the current view if it has a linter."""
 
     def is_enabled(self):
@@ -92,11 +92,10 @@ class SublimelinterLintCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         """Lint the current view."""
         from .sublimelinter import SublimeLinter
-        SublimeLinter.shared_plugin().lint(self.view.id())
+        SublimeLinter.shared_plugin().hit(self.view)
 
 
 class HasErrorsCommand:
-
     """
     A mixin class for sublime_plugin.TextCommand subclasses.
 
@@ -111,7 +110,6 @@ class HasErrorsCommand:
 
 
 class GotoErrorCommand(sublime_plugin.TextCommand):
-
     """A superclass for commands that go to the next/previous error."""
 
     def goto_error(self, view, errors, direction='next'):
@@ -141,16 +139,16 @@ class GotoErrorCommand(sublime_plugin.TextCommand):
         if direction == 'next':
             for region in regions:
                 if (
-                    (point == region.begin() and empty_selection and not region.empty())
-                    or (point < region.begin())
+                    (point == region.begin() and empty_selection and not region.empty()) or
+                    (point < region.begin())
                 ):
                     region_to_select = region
                     break
         else:
             for region in reversed(regions):
                 if (
-                    (point == region.end() and empty_selection and not region.empty())
-                    or (point > region.end())
+                    (point == region.end() and empty_selection and not region.empty()) or
+                    (point > region.end())
                 ):
                     region_to_select = region
                     break
@@ -208,27 +206,30 @@ class GotoErrorCommand(sublime_plugin.TextCommand):
 
 
 class SublimelinterGotoErrorCommand(GotoErrorCommand):
-
     """A command that selects the next/previous error."""
 
     @error_command
-    def run(self, view, errors, **kwargs):
+    def run(self, view, errors, highlights, **kwargs):
         """Run the command."""
         self.goto_error(view, errors, **kwargs)
 
 
 class SublimelinterShowAllErrors(sublime_plugin.TextCommand):
-
     """A command that shows a quick panel with all of the errors in the current view."""
 
     @error_command
-    def run(self, view, errors):
+    def run(self, view, errors, highlights):
         """Run the command."""
         self.errors = errors
+        self.highlights = highlights
         self.points = []
         options = []
 
         for lineno, line_errors in sorted(errors.items()):
+            if persist.settings.get("passive_warnings", False):
+                if self.highlights.line_type(lineno) != highlight.ERROR:
+                    continue
+
             line = view.substr(view.full_line(view.text_point(lineno, 0))).rstrip('\n\r')
 
             # Strip whitespace from the front of the line, but keep track of how much was
@@ -279,10 +280,10 @@ class SublimelinterShowAllErrors(sublime_plugin.TextCommand):
 
 
 class SublimelinterToggleSettingCommand(sublime_plugin.WindowCommand):
-
     """Command that toggles a setting."""
 
     def __init__(self, window):
+        """Initialize a new instance."""
         super().__init__(window)
 
     def is_visible(self, **args):
@@ -320,10 +321,10 @@ class SublimelinterToggleSettingCommand(sublime_plugin.WindowCommand):
 
 
 class ChooseSettingCommand(sublime_plugin.WindowCommand):
-
     """An abstract base class for commands that choose a setting from a list."""
 
     def __init__(self, window, setting=None, preview=False):
+        """Initialize a new instance."""
         super().__init__(window)
         self.setting = setting
         self._settings = None
@@ -490,7 +491,6 @@ def choose_setting_command(setting, preview):
 
 @choose_setting_command('lint_mode', preview=False)
 class SublimelinterChooseLintModeCommand(ChooseSettingCommand):
-
     """A command that selects a lint mode from a list."""
 
     def get_settings(self):
@@ -508,7 +508,6 @@ class SublimelinterChooseLintModeCommand(ChooseSettingCommand):
 
 @choose_setting_command('mark_style', preview=True)
 class SublimelinterChooseMarkStyleCommand(ChooseSettingCommand):
-
     """A command that selects a mark style from a list."""
 
     def get_settings(self):
@@ -518,7 +517,6 @@ class SublimelinterChooseMarkStyleCommand(ChooseSettingCommand):
 
 @choose_setting_command('gutter_theme', preview=True)
 class SublimelinterChooseGutterThemeCommand(ChooseSettingCommand):
-
     """A command that selects a gutter theme from a list."""
 
     def get_settings(self):
@@ -631,10 +629,10 @@ class SublimelinterChooseGutterThemeCommand(ChooseSettingCommand):
 
 
 class SublimelinterToggleLinterCommand(sublime_plugin.WindowCommand):
-
     """A command that toggles, enables, or disables linter plugins."""
 
     def __init__(self, window):
+        """Initialize a new instance."""
         super().__init__(window)
         self.linters = {}
 
@@ -646,13 +644,13 @@ class SublimelinterToggleLinterCommand(sublime_plugin.WindowCommand):
             linters = []
             settings = persist.settings.get('linters', {})
 
-            for linter in persist.linter_classes:
-                linter_settings = settings.get(linter, {})
+            for instance in persist.linter_classes:
+                linter_settings = settings.get(instance, {})
                 disabled = linter_settings.get('@disable')
 
                 if which == 'all':
                     include = True
-                    linter = [linter, 'disabled' if disabled else 'enabled']
+                    instance = [instance, 'disabled' if disabled else 'enabled']
                 else:
                     include = (
                         which == 'enabled' and not disabled or
@@ -660,7 +658,7 @@ class SublimelinterToggleLinterCommand(sublime_plugin.WindowCommand):
                     )
 
                 if include:
-                    linters.append(linter)
+                    linters.append(instance)
 
             linters.sort()
             self.linters[which] = linters
@@ -692,7 +690,6 @@ class SublimelinterToggleLinterCommand(sublime_plugin.WindowCommand):
 
 
 class SublimelinterCreateLinterPluginCommand(sublime_plugin.WindowCommand):
-
     """A command that creates a new linter plugin."""
 
     def run(self):
@@ -829,7 +826,7 @@ class SublimelinterCreateLinterPluginCommand(sublime_plugin.WindowCommand):
             '__class__': self.camel_case(name),
             '__superclass__': info.get('superclass', 'Linter'),
             '__cmd__': '{}@python'.format(name) if language == 'python' else name,
-            '__extra_attributes__': extra_attributes,
+            '# __extra_attributes__': extra_attributes,
             '__platform__': platform,
             '__install__': info['installer'].format(name),
             '__extra_install_steps__': extra_steps
@@ -896,7 +893,6 @@ class SublimelinterCreateLinterPluginCommand(sublime_plugin.WindowCommand):
 
 
 class SublimelinterPackageControlCommand(sublime_plugin.WindowCommand):
-
     """
     Abstract superclass for Package Control utility commands.
 
@@ -907,6 +903,7 @@ class SublimelinterPackageControlCommand(sublime_plugin.WindowCommand):
     TAG_RE = re.compile(r'(?P<major>\d+)\.(?P<minor>\d+)\.(?P<release>\d+)(?:\+\d+)?')
 
     def __init__(self, window):
+        """Initialize a new instance."""
         super().__init__(window)
         self.git = ''
 
@@ -927,15 +924,12 @@ class SublimelinterPackageControlCommand(sublime_plugin.WindowCommand):
         """
         Return True if path is an eligible directory.
 
-        A directory is eligible if it is a direct child of Packages,
-        has a messages subdirectory, and has messages.json.
+        A directory is eligible if it has a messages subdirectory
+        and has messages.json.
 
         """
-        packages_path = sublime.packages_path()
-
         return (
             os.path.isdir(path) and
-            os.path.dirname(path) == packages_path and
             os.path.isdir(os.path.join(path, 'messages')) and
             os.path.isfile(os.path.join(path, 'messages.json'))
         )
@@ -963,7 +957,6 @@ class SublimelinterPackageControlCommand(sublime_plugin.WindowCommand):
 
 
 class SublimelinterNewPackageControlMessageCommand(SublimelinterPackageControlCommand):
-
     """
     This command automates the process of creating new Package Control release messages.
 
@@ -975,6 +968,7 @@ class SublimelinterNewPackageControlMessageCommand(SublimelinterPackageControlCo
     COMMIT_MSG_RE = re.compile(r'{{{{(.+?)}}}}')
 
     def __init__(self, window):
+        """Initialize a new instance."""
         super().__init__(window)
 
     def run(self, paths=[]):
@@ -1087,8 +1081,36 @@ class SublimelinterNewPackageControlMessageCommand(SublimelinterPackageControlCo
         return '\n\n'.join(messages) + '\n'
 
 
-class SublimelinterReportCommand(sublime_plugin.WindowCommand):
+class SublimelinterClearColorSchemeFolderCommand(sublime_plugin.WindowCommand):
+    """A command that clears all of SublimeLinter made color schemes."""
 
+    def run(self):
+        """Run the command."""
+        base_path = os.path.join(sublime.packages_path(), 'User', '*.tmTheme')
+        sublime_path = os.path.join(sublime.packages_path(), 'User', 'SublimeLinter', '*.tmTheme')
+        themes = glob(base_path) + glob(sublime_path)
+        prefs = sublime.load_settings('Preferences.sublime-settings')
+        scheme = prefs.get('color_scheme')
+
+        for theme in themes:
+            # Ensure it is a (SL) theme and it is not current current scheme
+            if re.search(r'\(SL\)', theme) and os.path.normpath(scheme) not in theme:
+                persist.debug('deleting {}'.format(os.path.split(theme)[1]))
+                os.remove(theme)
+
+
+class SublimelinterClearCachesCommand(sublime_plugin.WindowCommand):
+    """A command that clears all of SublimeLinter's internal caches."""
+
+    def run(self):
+        """Run the command."""
+        util.clear_path_caches()
+        util.get_rc_settings.cache_clear()
+        util.find_file.cache_clear()
+        linter.Linter.clear_settings_caches()
+
+
+class SublimelinterReportCommand(sublime_plugin.WindowCommand):
     """
     A command that displays a report of all errors.
 
@@ -1141,10 +1163,10 @@ class SublimelinterReportCommand(sublime_plugin.WindowCommand):
                 filename = os.path.basename(linters[0].filename or 'untitled')
                 out = '\n{}:\n'.format(filename)
 
-                for linter in sorted(linters, key=lambda linter: linter.name):
-                    if linter.errors:
-                        out += '\n  {}:\n'.format(linter.name)
-                        items = sorted(linter.errors.items())
+                for lint in sorted(linters, key=lambda lint: lint.name):
+                    if lint.errors:
+                        out += '\n  {}:\n'.format(lint.name)
+                        items = sorted(lint.errors.items())
 
                         # Get the highest line number so we know how much padding numbers need
                         highest_line = items[-1][0]
@@ -1156,7 +1178,7 @@ class SublimelinterReportCommand(sublime_plugin.WindowCommand):
 
                         for line, messages in items:
                             for col, message in messages:
-                                out += '    {:>{width}}: {}\n'.format(line, message, width=width)
+                                out += '    {:>{width}}: {}\n'.format(line + 1, message, width=width)
 
                 output.insert(edit, output.size(), out)
 
