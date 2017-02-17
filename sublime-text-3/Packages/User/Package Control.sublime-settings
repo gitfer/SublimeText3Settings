@@ -6,6 +6,7 @@
 	"installed_packages":
 	[
 		"Babel",
+		"Babel Snippets",
 		"Cheat Sheets",
 		"CSSTidy",
 		"Emmet",
