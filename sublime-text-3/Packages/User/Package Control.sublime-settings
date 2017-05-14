@@ -10,10 +10,14 @@
 		"Cheat Sheets",
 		"CSSTidy",
 		"Emmet",
+		"ESLint",
+		"ESLint-Formatter",
 		"HTML5",
 		"JsFormat",
+		"LPrint",
 		"Package Control",
 		"SublimeLinter",
+		"SublimeLinter-contrib-eslint",
 		"SublimeLinter-html-tidy",
 		"SublimeLinter-jshint"
 	]

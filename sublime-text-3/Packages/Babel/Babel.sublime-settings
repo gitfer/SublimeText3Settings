@@ -1,5 +1,5 @@
 {
-  "debug": false,
+  "debug": true,
   "use_local_babel": true,
   "node_modules": {
     "windows": "C:/Program Files/nodejs/node_modules",

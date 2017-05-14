@@ -3,6 +3,12 @@
 	"font_size": 9,
 	"ignored_packages":
 	[
+		"Cheat Sheets",
+		"CSSTidy",
+		"Emmet",
+		"JsFormat",
+		"SublimeLinter-html-tidy",
+		"SublimeLinter-jshint",
 		"Vintage"
 	]
 }
